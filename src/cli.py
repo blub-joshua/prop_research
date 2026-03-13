@@ -12,6 +12,7 @@ Commands
     ingest            Run ingestion pipelines
     features          Rebuild player features
     train             Train / load projection models
+    daily             Load props, compute projections + EV, suggest bets
     analyze           Compute EV on today's props and rank them
     backtest          Backtest projections against historical lines
     show-props        Pretty-print loaded props
@@ -25,6 +26,7 @@ Examples
     python src/cli.py ingest --module injuries
     python src/cli.py features
     python src/cli.py train --force-retrain
+    python src/cli.py daily --props-file data/today_props_raw.json
     python src/cli.py analyze --date 2025-01-15
     python src/cli.py analyze --props-file data/today_props_raw.json
     python src/cli.py backtest
@@ -471,6 +473,157 @@ def _print_combos_table(df) -> None:
             f"{row.get('combo_ev', 0):.1%}",
         )
     console.print(table)
+
+
+# ---------------------------------------------------------------------------
+# daily
+# ---------------------------------------------------------------------------
+
+@cli.command("daily")
+@click.option("--props-file", required=True, type=click.Path(exists=True),
+              help="Path to today's props JSON or CSV file.")
+@click.option("--top-n-singles", type=int, default=10,
+              help="Number of top single props to display (default: 10).")
+@click.option("--top-n-combos", type=int, default=2,
+              help="Number of top 2-leg combos to display (default: 2).")
+@click.option("--date", "game_date", default=None,
+              help="Game date YYYY-MM-DD (default: today).")
+@click.pass_context
+def cmd_daily(
+    ctx: click.Context,
+    props_file: str,
+    top_n_singles: int,
+    top_n_combos: int,
+    game_date: str | None,
+) -> None:
+    """Daily workflow: load props, compute projections, rank by EV, suggest combos."""
+    from datetime import datetime
+    from props_io import load_and_prepare_props, preview_props
+    from projections import build_projections_for_date, resolve_context_maps
+    from ev_calc import (
+        enrich_props_with_ev, rank_single_props, rank_combos, kelly_bet_size,
+    )
+    from db import get_connection
+
+    cfg = ctx.obj["config"]
+    ev_threshold = float(os.getenv("EV_THRESHOLD", "0.03"))
+    bankroll     = float(os.getenv("BANKROLL", "1000"))
+    max_kelly    = float(os.getenv("MAX_KELLY_FRACTION", "0.05"))
+
+    game_date_obj = (
+        datetime.strptime(game_date, "%Y-%m-%d").date()
+        if game_date else date.today()
+    )
+
+    console.rule(f"[bold]Daily Props Analysis — {game_date_obj}[/bold]")
+
+    # ── 1. Load and preview props ─────────────────────────────────────────
+    console.print(f"[cyan]Loading props from {props_file}...[/cyan]")
+    con = get_connection()
+    try:
+        props_df = load_and_prepare_props(props_file, con=con)
+    except FileNotFoundError as e:
+        console.print(f"[red]{e}[/red]")
+        con.close()
+        return
+
+    console.print(f"  Loaded [bold]{len(props_df)}[/bold] prop lines.")
+    preview_props(props_df)
+
+    if not click.confirm("Continue with EV calculation?", default=True):
+        console.print("[yellow]Aborted.[/yellow]")
+        con.close()
+        return
+
+    # ── 2. Build projections ──────────────────────────────────────────────
+    console.print("[cyan]Building projections...[/cyan]")
+    player_ids = props_df["player_id"].dropna().unique().tolist()
+    if not player_ids:
+        console.print("[red]No player IDs resolved — cannot compute projections.[/red]")
+        console.print("Check that the players table is populated and names match.")
+        con.close()
+        return
+
+    opponent_map, is_home_map = resolve_context_maps(props_df, con)
+
+    try:
+        proj_df = build_projections_for_date(
+            player_ids=[int(p) for p in player_ids],
+            game_date=game_date_obj,
+            opponent_map=opponent_map,
+            is_home_map=is_home_map,
+            con=con,
+        )
+    except (FileNotFoundError, NotImplementedError) as e:
+        console.print(f"[red]Projection error: {e}[/red]")
+        con.close()
+        return
+
+    if proj_df.empty:
+        console.print("[yellow]No projections could be generated. Check data.[/yellow]")
+        con.close()
+        return
+
+    console.print(f"  Projections ready for [bold]{len(proj_df)}[/bold] players.")
+
+    # ── 3. Compute EV ─────────────────────────────────────────────────────
+    console.print("[cyan]Computing EV...[/cyan]")
+    vig_method = cfg.get("ev", {}).get("vig_removal", "multiplicative")
+    ev_df = enrich_props_with_ev(props_df, proj_df, vig_removal=vig_method)
+
+    # ── 4. Rank singles ───────────────────────────────────────────────────
+    top_singles = rank_single_props(
+        ev_df, ev_threshold=ev_threshold, top_n=top_n_singles,
+    )
+
+    console.rule("[bold green]Top Single Props by EV[/bold green]")
+    if top_singles.empty:
+        console.print(
+            f"[yellow]No props exceed EV threshold of {ev_threshold:.1%}[/yellow]"
+        )
+    else:
+        _print_singles_table(top_singles, bankroll, max_kelly)
+
+        # Highlight top 2 as suggested bets
+        if len(top_singles) >= 1:
+            console.print()
+            console.rule("[bold magenta]Suggested Bets[/bold magenta]")
+            for _, row in top_singles.head(2).iterrows():
+                bet_size = kelly_bet_size(
+                    row.get("kelly_best", 0), bankroll, max_kelly,
+                )
+                side = row.get("best_side", "?")
+                odds_col = "over_odds" if side == "over" else "under_odds"
+                console.print(
+                    f"  [bold]{row['player_name']}[/bold]  "
+                    f"{row['market'].upper()}  "
+                    f"{side.upper()} {row['line']}  "
+                    f"({int(row.get(odds_col, 0)):+d})  "
+                    f"Proj: [yellow]{row.get('projection', 0):.1f}[/yellow]  "
+                    f"EV: [green]{row['best_ev']:.1%}[/green]  "
+                    f"Suggested: [bold]${bet_size:.0f}[/bold]"
+                )
+
+    # ── 5. Rank combos ────────────────────────────────────────────────────
+    console.print()
+    console.rule("[bold blue]Best 2-Leg Combos[/bold blue]")
+    top_combos = rank_combos(
+        ev_df, n_legs=2, ev_threshold=ev_threshold, top_n=top_n_combos,
+    )
+    if top_combos.empty:
+        console.print("[yellow]No qualifying 2-leg combos found.[/yellow]")
+    else:
+        _print_combos_table(top_combos)
+
+    # ── 6. Save report ────────────────────────────────────────────────────
+    reports_dir = _PROJECT_ROOT / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    report_name = f"daily_{game_date_obj.strftime('%Y%m%d')}_props.csv"
+    report_path = reports_dir / report_name
+    ev_df.to_csv(report_path, index=False)
+    console.print(f"\n[dim]Report saved to {report_path}[/dim]")
+
+    con.close()
 
 
 # ---------------------------------------------------------------------------

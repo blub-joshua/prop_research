@@ -273,12 +273,12 @@ def enrich_props_with_ev(
         kelly_over, kelly_under,
         best_side, best_ev.
     """
-    _DEFAULT_STD_MAP = {
+    _DEFAULT_STD_MAP: dict[str, str | None] = {
         "points":                  "pts_std_L10",
         "rebounds":                "reb_std_L10",
         "assists":                 "ast_std_L10",
         "threepm":                 "fg3m_std_L10",
-        # Composite stds — approximate with Pythagorean combination
+        # Composite stds — approximated below via Pythagorean combination
         "points_rebounds":         None,
         "points_assists":          None,
         "rebounds_assists":        None,
@@ -286,24 +286,168 @@ def enrich_props_with_ev(
     }
     std_col_map = std_col_map or _DEFAULT_STD_MAP
 
-    # TODO: full implementation
-    #
-    # High-level steps:
-    #   1. Merge projections_df into props_df on player_id.
-    #   2. For each row:
-    #      a. Pull projection = projections_df[f"proj_{market}"]
-    #      b. Pull std from std_col_map[market] (or approximate for composites)
-    #      c. Compute model_p_over = estimate_win_prob_normal(proj, line, std, "over")
-    #      d. Remove vig: no_vig_p_over, no_vig_p_under = remove_vig_*(over_odds, under_odds)
-    #         (The no_vig probs are the book's estimate; model prob is ours.)
-    #      e. Compute decimal_over = american_to_decimal(over_odds)
-    #      f. ev_over = compute_ev(model_p_over, decimal_over)
-    #      g. kelly_over = kelly_fraction(model_p_over, decimal_over)
-    #      h. Repeat for under.
-    #      i. best_side = "over" if ev_over > ev_under else "under"
-    #         best_ev   = max(ev_over, ev_under)
-    #   3. Return enriched DataFrame.
-    raise NotImplementedError("enrich_props_with_ev() not yet implemented")
+    # Mapping from internal market key to projection column
+    _PROJ_COL: dict[str, str] = {
+        "points":                  "proj_points",
+        "rebounds":                "proj_rebounds",
+        "assists":                 "proj_assists",
+        "threepm":                 "proj_threepm",
+        "points_rebounds":         "proj_points_rebounds",
+        "points_assists":          "proj_points_assists",
+        "rebounds_assists":        "proj_rebounds_assists",
+        "points_rebounds_assists": "proj_points_rebounds_assists",
+    }
+
+    # Composite market -> component base std columns (independence assumption:
+    # sigma_combo = sqrt(sigma_a^2 + sigma_b^2 + ...)).
+    _COMPOSITE_STD_PARTS: dict[str, list[str]] = {
+        "points_rebounds":         ["pts_std_L10", "reb_std_L10"],
+        "points_assists":          ["pts_std_L10", "ast_std_L10"],
+        "rebounds_assists":        ["reb_std_L10", "ast_std_L10"],
+        "points_rebounds_assists": ["pts_std_L10", "reb_std_L10", "ast_std_L10"],
+    }
+
+    # Vig removal dispatcher
+    _remove_vig = (
+        remove_vig_multiplicative if vig_removal == "multiplicative"
+        else remove_vig_additive
+    )
+
+    # ── 1. Merge projections into props on player_id ──────────────────────
+    df = props_df.copy()
+
+    if projections_df is not None and not projections_df.empty:
+        # Keep only projection + std columns to avoid column collisions
+        proj_cols_to_keep = ["player_id"]
+        proj_cols_to_keep += [c for c in projections_df.columns if c.startswith("proj_")]
+        proj_cols_to_keep += [c for c in projections_df.columns if c.endswith("_std_L10")]
+        proj_cols_to_keep = list(dict.fromkeys(proj_cols_to_keep))  # dedupe, keep order
+        available = [c for c in proj_cols_to_keep if c in projections_df.columns]
+        df = df.merge(projections_df[available], on="player_id", how="left")
+    else:
+        logger.warning("No projections supplied — EV columns will be NaN.")
+
+    # ── 2. Per-row EV computation ─────────────────────────────────────────
+    # Default std fallbacks per base stat (if feature columns are missing)
+    _DEFAULT_STD_FALLBACK: dict[str, float] = {
+        "points": 6.0, "rebounds": 2.5, "assists": 2.0, "threepm": 1.2,
+    }
+
+    out_projection   = []
+    out_std          = []
+    out_mp_over      = []
+    out_mp_under     = []
+    out_nv_over      = []
+    out_nv_under     = []
+    out_ev_over      = []
+    out_ev_under     = []
+    out_kelly_over   = []
+    out_kelly_under  = []
+    out_best_side    = []
+    out_best_ev      = []
+    out_kelly_best   = []
+
+    for _, row in df.iterrows():
+        market = str(row.get("market", ""))
+        line   = float(row.get("line", 0))
+        over_odds  = float(row.get("over_odds", -110))
+        under_odds = float(row.get("under_odds", -110))
+
+        # --- projection ---
+        proj_col = _PROJ_COL.get(market)
+        projection = float(row.get(proj_col, np.nan)) if proj_col and proj_col in df.columns else np.nan
+
+        # --- std ---
+        std_col = std_col_map.get(market)
+        if std_col and std_col in df.columns:
+            std_val = float(row.get(std_col, np.nan))
+        elif market in _COMPOSITE_STD_PARTS:
+            # Pythagorean combination for composite markets
+            parts = []
+            for sc in _COMPOSITE_STD_PARTS[market]:
+                v = float(row.get(sc, np.nan)) if sc in df.columns else np.nan
+                if pd.isna(v) or v <= 0:
+                    # Infer base stat name from column (e.g. pts_std_L10 -> points)
+                    base = sc.replace("_std_L10", "").replace("fg3m", "threepm")
+                    base = {"pts": "points", "reb": "rebounds", "ast": "assists"}.get(base, base)
+                    v = _DEFAULT_STD_FALLBACK.get(base, 3.0)
+                parts.append(v)
+            std_val = float(np.sqrt(sum(s ** 2 for s in parts)))
+        else:
+            std_val = np.nan
+
+        # Fallback: if std is missing or zero, use a sensible default
+        if pd.isna(std_val) or std_val <= 0:
+            base_market = market.split("_")[0] if "_" not in market else market
+            std_val = _DEFAULT_STD_FALLBACK.get(base_market, max(projection * 0.3, 1.0) if not pd.isna(projection) else 5.0)
+
+        out_projection.append(projection)
+        out_std.append(std_val)
+
+        if pd.isna(projection):
+            # Cannot compute EV without a projection
+            out_mp_over.append(np.nan); out_mp_under.append(np.nan)
+            out_nv_over.append(np.nan); out_nv_under.append(np.nan)
+            out_ev_over.append(np.nan); out_ev_under.append(np.nan)
+            out_kelly_over.append(np.nan); out_kelly_under.append(np.nan)
+            out_best_side.append(None); out_best_ev.append(np.nan)
+            out_kelly_best.append(np.nan)
+            continue
+
+        # Model win probabilities
+        mp_over  = estimate_win_prob_normal(projection, line, std_val, "over")
+        mp_under = 1.0 - mp_over
+
+        # No-vig (book's fair) probabilities
+        nv_over, nv_under = _remove_vig(over_odds, under_odds)
+
+        # Decimal odds
+        dec_over  = american_to_decimal(over_odds)
+        dec_under = american_to_decimal(under_odds)
+
+        # EV per unit
+        ev_over  = compute_ev(mp_over, dec_over)
+        ev_under = compute_ev(mp_under, dec_under)
+
+        # Kelly fractions
+        k_over  = kelly_fraction(mp_over, dec_over)
+        k_under = kelly_fraction(mp_under, dec_under)
+
+        # Best side
+        if ev_over >= ev_under:
+            best_side = "over"
+            best_ev   = ev_over
+            k_best    = k_over
+        else:
+            best_side = "under"
+            best_ev   = ev_under
+            k_best    = k_under
+
+        out_mp_over.append(mp_over);   out_mp_under.append(mp_under)
+        out_nv_over.append(nv_over);   out_nv_under.append(nv_under)
+        out_ev_over.append(ev_over);   out_ev_under.append(ev_under)
+        out_kelly_over.append(k_over); out_kelly_under.append(k_under)
+        out_best_side.append(best_side)
+        out_best_ev.append(best_ev)
+        out_kelly_best.append(k_best)
+
+    # ── 3. Attach computed columns ────────────────────────────────────────
+    df["projection"]     = out_projection
+    df["std"]            = out_std
+    df["model_p_over"]   = out_mp_over
+    df["model_p_under"]  = out_mp_under
+    df["no_vig_p_over"]  = out_nv_over
+    df["no_vig_p_under"] = out_nv_under
+    df["ev_over"]        = out_ev_over
+    df["ev_under"]       = out_ev_under
+    df["kelly_over"]     = out_kelly_over
+    df["kelly_under"]    = out_kelly_under
+    df["best_side"]      = out_best_side
+    df["best_ev"]        = out_best_ev
+    df["kelly_best"]     = out_kelly_best
+
+    logger.info("EV enrichment complete: %d rows.", len(df))
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -374,6 +518,10 @@ def rank_combos(
         )
         return pd.DataFrame()
 
+    # NOTE: Independence assumption — combo probability = product of
+    # individual leg model probabilities.  This is a simplification;
+    # correlated outcomes (e.g. two players in the same game) are not
+    # accounted for.
     combo_rows = []
     for combo in itertools.combinations(candidates.itertuples(index=False), n_legs):
         # Compute joint probability and decimal odds
@@ -382,20 +530,25 @@ def rank_combos(
 
         for leg in combo:
             side = leg.best_side
+            # Use model probabilities (populated by enrich_props_with_ev)
             if side == "over":
-                p_win_joint   *= american_to_implied_prob(leg.over_odds)   # placeholder — use model_p_over
+                p_leg = getattr(leg, "model_p_over", None)
+                if p_leg is None or pd.isna(p_leg):
+                    p_leg = american_to_implied_prob(leg.over_odds)
                 decimal_joint *= american_to_decimal(leg.over_odds)
             else:
-                p_win_joint   *= american_to_implied_prob(leg.under_odds)
+                p_leg = getattr(leg, "model_p_under", None)
+                if p_leg is None or pd.isna(p_leg):
+                    p_leg = american_to_implied_prob(leg.under_odds)
                 decimal_joint *= american_to_decimal(leg.under_odds)
-            # TODO: replace american_to_implied_prob above with model_p_{side}
-            #       once enrich_props_with_ev() is implemented.
+            p_win_joint *= p_leg
 
         ev_combo    = compute_ev(p_win_joint, decimal_joint)
         kelly_combo = kelly_fraction(p_win_joint, decimal_joint)
 
         combo_rows.append({
             "legs":             [f"{leg.player_name} {leg.market} {leg.best_side} {leg.line}" for leg in combo],
+            "p_combo":          round(p_win_joint, 6),
             "combo_decimal":    round(decimal_joint, 3),
             "combo_ev":         round(ev_combo, 4),
             "combo_kelly":      round(kelly_combo, 4),

@@ -110,7 +110,11 @@ def load_props_json(path: str | Path) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(f"Props file not found: {path}")
     with path.open() as f:
-        data = json.load(f)
+        raw_text = f.read()
+    # Handle +NNN style numbers that some LLMs produce (invalid JSON)
+    import re
+    raw_text = re.sub(r':\s*\+(\d)', r': \1', raw_text)
+    data = json.loads(raw_text)
     if not isinstance(data, list):
         raise ValueError("Expected a JSON array at the top level.")
     df = pd.DataFrame(data)
@@ -268,26 +272,89 @@ def normalise_props(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def resolve_player_ids_for_props(df: pd.DataFrame, con) -> pd.DataFrame:
-    """Match player_name in props to player_id in the players table.
+    """Match player_name in props to player_id in the ``players`` table.
+
+    Strategy:
+      1. Load distinct (player_id, full_name) from players.
+      2. Normalise both sides (lowercase, strip extra whitespace/punctuation).
+      3. Exact match first.
+      4. Fuzzy match (difflib.get_close_matches) as fallback for unmatched.
+      5. Merge player_id back into df.  Log any still-unmatched names.
 
     Parameters
     ----------
     df : pd.DataFrame
-        Normalised props DataFrame.
+        Normalised props DataFrame (must contain ``player_name``).
     con : duckdb.DuckDBPyConnection
 
     Returns
     -------
     pd.DataFrame
-        Input df with player_id column populated where a match is found.
+        Input df with ``player_id`` column populated where a match is found.
     """
-    # TODO:
-    #   1. Load distinct (player_id, full_name) from players.
-    #   2. Normalise both sides (lowercase, remove punctuation).
-    #   3. Exact match first; fuzzy match (difflib or rapidfuzz) as fallback.
-    #   4. Merge player_id back into df.
-    #   5. Log unmatched names.
-    raise NotImplementedError("resolve_player_ids_for_props() not yet implemented")
+    import re
+    from difflib import get_close_matches
+
+    players = con.execute(
+        "SELECT player_id, full_name FROM players WHERE full_name IS NOT NULL"
+    ).df()
+    if players.empty:
+        logger.warning("Players table is empty — cannot resolve IDs.")
+        return df
+
+    def _normalise_name(name: str) -> str:
+        """Lowercase, strip accents-ish, collapse whitespace."""
+        name = str(name).lower().strip()
+        name = re.sub(r"[^a-z0-9 ]", "", name)  # remove punctuation
+        name = re.sub(r"\s+", " ", name)
+        return name
+
+    # Build lookup dict:  normalised_name -> player_id
+    name_to_id: dict[str, int] = {}
+    norm_to_original: dict[str, str] = {}  # for fuzzy matching
+    for _, row in players.iterrows():
+        norm = _normalise_name(row["full_name"])
+        name_to_id[norm] = int(row["player_id"])
+        norm_to_original[norm] = row["full_name"]
+
+    all_norm_names = list(name_to_id.keys())
+
+    resolved_ids = []
+    unmatched = []
+    for raw_name in df["player_name"]:
+        norm = _normalise_name(raw_name)
+
+        # Exact match
+        if norm in name_to_id:
+            resolved_ids.append(name_to_id[norm])
+            continue
+
+        # Fuzzy match (cutoff 0.75 — fairly lenient)
+        matches = get_close_matches(norm, all_norm_names, n=1, cutoff=0.75)
+        if matches:
+            pid = name_to_id[matches[0]]
+            logger.debug(
+                "  Fuzzy matched '%s' -> '%s' (id=%d)",
+                raw_name, norm_to_original[matches[0]], pid,
+            )
+            resolved_ids.append(pid)
+        else:
+            unmatched.append(raw_name)
+            resolved_ids.append(None)
+
+    df = df.copy()
+    df["player_id"] = resolved_ids
+    df["player_id"] = pd.to_numeric(df["player_id"], errors="coerce").astype("Int64")
+
+    if unmatched:
+        logger.warning(
+            "Could not resolve %d player name(s): %s",
+            len(unmatched), unmatched[:10],
+        )
+
+    matched_count = df["player_id"].notna().sum()
+    logger.info("  Resolved %d / %d player IDs.", matched_count, len(df))
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -324,6 +391,46 @@ def load_and_prepare_props(path: str | Path, con=None) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 # Writer
 # ---------------------------------------------------------------------------
+
+def preview_props(df: pd.DataFrame, max_rows: int = 20) -> None:
+    """Print a nicely formatted table of props to the console.
+
+    Uses ``rich`` for coloured terminal output.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Normalised props DataFrame.
+    max_rows : int
+        Maximum rows to display.
+    """
+    try:
+        from rich.console import Console
+        from rich.table import Table
+        from rich import box
+
+        _console = Console()
+        table = Table(
+            title=f"Props Preview  ({min(max_rows, len(df))} of {len(df)} rows)",
+            box=box.ROUNDED,
+        )
+        display_cols = [
+            c for c in
+            ["player_name", "market", "line", "over_odds", "under_odds",
+             "book", "game_date", "player_id"]
+            if c in df.columns
+        ]
+        for col in display_cols:
+            style = "cyan" if col == "player_name" else "white"
+            table.add_column(col, style=style)
+
+        for _, row in df.head(max_rows).iterrows():
+            table.add_row(*[str(row.get(c, "")) for c in display_cols])
+
+        _console.print(table)
+    except ImportError:
+        print(df.head(max_rows).to_string(index=False))
+
 
 def save_props_json(df: pd.DataFrame, path: str | Path) -> None:
     """Save a normalised props DataFrame back to JSON.
