@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Environments
+.venv/
+venv/
+ENV/
+.env
+
+# DuckDB (large binary — keep out of git)
+data/nba_props.duckdb
+data/nba_props.duckdb.wal
+
+# Trained model files (often large)
+models/*.pkl
+models/*.lgb
+models/*.xgb
+
+# Daily prop files (ephemeral)
+data/today_props_raw.json
+data/today_props_raw.csv
+data/ocr_raw_output.txt
+
+# Screenshots
+screenshots/
+
+# Logs
+logs/*.log
+
+# IDE / OS
+.idea/
+.vscode/
+*.DS_Store
+Thumbs.db

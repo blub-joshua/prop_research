@@ -1,0 +1,141 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# NBA Props Research Tool — Application Configuration
+# Fine-grained knobs beyond what lives in .env.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Feature engineering ───────────────────────────────────────────────────────
+features:
+  # Rolling window sizes (in games) to compute for each stat.
+  rolling_windows: [5, 10, 20]
+
+  # Whether to include season-to-date averages as features.
+  include_season_avg: true
+
+  # Whether to include home/away split features.
+  include_home_away_splits: true
+
+  # Whether to include opponent defensive ranking features.
+  include_opponent_defense: true
+
+  # Whether to factor in days of rest.
+  include_rest_days: true
+
+  # Whether to include back-to-back game flag.
+  include_b2b_flag: true
+
+  # Minimum games played for a player to be included in modeling.
+  min_games_played: 10
+
+  # How many games back to use for pace/usage context features.
+  context_window: 5
+
+# ── Projection models ─────────────────────────────────────────────────────────
+models:
+  # Stat targets to model.  Each gets its own .pkl file.
+  targets:
+    - points
+    - rebounds
+    - assists
+    - threepm
+
+  # Backend to use: "ridge", "lightgbm", or "xgboost"
+  backend: lightgbm
+
+  # Cross-validation folds for hyperparameter search.
+  cv_folds: 5
+
+  # Whether to run a hyperparameter search on each retrain.
+  hyperparameter_search: false
+
+  lightgbm:
+    n_estimators: 500
+    learning_rate: 0.05
+    num_leaves: 31
+    min_child_samples: 20
+    subsample: 0.8
+    colsample_bytree: 0.8
+    reg_alpha: 0.1
+    reg_lambda: 0.1
+    random_state: 42
+    n_jobs: -1
+
+  xgboost:
+    n_estimators: 500
+    learning_rate: 0.05
+    max_depth: 6
+    subsample: 0.8
+    colsample_bytree: 0.8
+    reg_alpha: 0.1
+    reg_lambda: 0.1
+    random_state: 42
+    n_jobs: -1
+
+  ridge:
+    alpha: 1.0
+
+# ── EV / betting analysis ─────────────────────────────────────────────────────
+ev:
+  # Vig removal method: "multiplicative", "additive", or "power"
+  vig_removal: multiplicative
+
+  # Maximum number of legs in a combo (currently only 2 supported in v1).
+  max_combo_legs: 2
+
+  # Number of top single props to surface in output.
+  top_singles: 5
+
+  # Number of top combos to surface in output.
+  top_combos: 3
+
+  # Assume statistical independence between legs when computing combo EV.
+  assume_independence: true
+
+# ── Markets ──────────────────────────────────────────────────────────────────
+markets:
+  # Supported prop market names (must match what the LLM returns in JSON).
+  supported:
+    - points
+    - rebounds
+    - assists
+    - threepm
+    - points_rebounds
+    - points_assists
+    - rebounds_assists
+    - points_rebounds_assists
+
+  # Mapping from common sportsbook strings to internal market keys.
+  aliases:
+    "Pts":              points
+    "Points":           points
+    "PTS":              points
+    "Reb":              rebounds
+    "Rebounds":         rebounds
+    "REB":              rebounds
+    "Ast":              assists
+    "Assists":          assists
+    "AST":              assists
+    "3PM":              threepm
+    "3-Pointers Made":  threepm
+    "Threes":           threepm
+    "P+R":              points_rebounds
+    "Pts+Reb":          points_rebounds
+    "P+A":              points_assists
+    "Pts+Ast":          points_assists
+    "R+A":              rebounds_assists
+    "Reb+Ast":          rebounds_assists
+    "PRA":              points_rebounds_assists
+    "Pts+Reb+Ast":      points_rebounds_assists
+
+# ── Output / display ──────────────────────────────────────────────────────────
+output:
+  # Table format for rich/tabulate output: "rounded_grid", "simple", "pipe"
+  table_style: rounded_grid
+
+  # Number of decimal places for odds display.
+  odds_decimals: 0
+
+  # Number of decimal places for EV% display.
+  ev_decimals: 2
+
+  # Color-code rows above EV threshold in terminal output.
+  highlight_positive_ev: true

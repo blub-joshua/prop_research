@@ -1,0 +1,35 @@
+[
+  {
+    "player_name": "LeBron James",
+    "team": "LAL",
+    "opponent": "GSW",
+    "market": "points",
+    "line": 24.5,
+    "over_odds": -115,
+    "under_odds": -105,
+    "book": "DraftKings",
+    "game_date": "2025-01-15"
+  },
+  {
+    "player_name": "LeBron James",
+    "team": "LAL",
+    "opponent": "GSW",
+    "market": "rebounds",
+    "line": 7.5,
+    "over_odds": -110,
+    "under_odds": -110,
+    "book": "DraftKings",
+    "game_date": "2025-01-15"
+  },
+  {
+    "player_name": "Stephen Curry",
+    "team": "GSW",
+    "opponent": "LAL",
+    "market": "threepm",
+    "line": 4.5,
+    "over_odds": +105,
+    "under_odds": -125,
+    "book": "FanDuel",
+    "game_date": "2025-01-15"
+  }
+]
