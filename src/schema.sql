@@ -119,7 +119,7 @@ CREATE TABLE IF NOT EXISTS player_game_stats (
     usage_pct       NUMERIC(5,2),
     off_rating      NUMERIC(6,2),
     def_rating      NUMERIC(6,2),
-    pace            NUMERIC(6,2),
+    pace            FLOAT,
 
     created_at      TIMESTAMP DEFAULT current_timestamp,
 
@@ -170,7 +170,6 @@ CREATE TABLE IF NOT EXISTS player_features (
     season          VARCHAR(7),
     is_home         INTEGER,               -- 1=home, 0=away
 
-    -- ── Rolling averages (last N games, shifted — no future leakage) ────────
     pts_avg_L5      NUMERIC(6,2),
     pts_avg_L10     NUMERIC(6,2),
     reb_avg_L5      NUMERIC(6,2),
@@ -182,14 +181,12 @@ CREATE TABLE IF NOT EXISTS player_features (
     min_avg_L5      NUMERIC(6,2),
     min_avg_L10     NUMERIC(6,2),
 
-    -- ── Season-to-date averages (expanding mean, shifted) ───────────────────
     pts_avg_season  NUMERIC(6,2),
     reb_avg_season  NUMERIC(6,2),
     ast_avg_season  NUMERIC(6,2),
     fg3m_avg_season NUMERIC(6,2),
     min_avg_season  NUMERIC(6,2),
 
-    -- ── Rolling std-devs (variance / volatility features) ───────────────────
     pts_std_L5      NUMERIC(6,2),
     pts_std_L10     NUMERIC(6,2),
     reb_std_L5      NUMERIC(6,2),
@@ -199,17 +196,14 @@ CREATE TABLE IF NOT EXISTS player_features (
     fg3m_std_L5     NUMERIC(6,2),
     fg3m_std_L10    NUMERIC(6,2),
 
-    -- ── Opponent defense (last-10-game rolling averages of stats allowed) ──────
-    opp_pts_allowed_avg  NUMERIC(6,2),   -- opp PTS allowed per game (L10)
+    opp_pts_allowed_avg  NUMERIC(6,2),
     opp_reb_allowed_avg  NUMERIC(6,2),
     opp_ast_allowed_avg  NUMERIC(6,2),
     opp_fg3m_allowed_avg NUMERIC(6,2),
 
-    -- ── Schedule / pace context ────────────────────────────────────────────
-    pace_L5              NUMERIC(6,2),   -- player's team rolling L5 pace
-    injury_severity      SMALLINT,       -- 0=Active, 1=Probable, 2=Q, 3=Doubtful, 4=Out
+    pace_L5              NUMERIC(6,2),
+    injury_severity      SMALLINT,
 
-    -- ── Home/away splits (season-to-date) ───────────────────────────────────
     pts_avg_home    NUMERIC(6,2),
     pts_avg_away    NUMERIC(6,2),
     reb_avg_home    NUMERIC(6,2),
@@ -217,12 +211,10 @@ CREATE TABLE IF NOT EXISTS player_features (
     ast_avg_home    NUMERIC(6,2),
     ast_avg_away    NUMERIC(6,2),
 
-    -- ── Rest / schedule context ─────────────────────────────────────────────
-    days_rest               SMALLINT,   -- days since last game (NULL if first)
-    games_played_season     SMALLINT,   -- cumulative games this season
+    days_rest               SMALLINT,
+    games_played_season     SMALLINT,
 
-    -- ── Injury flag ─────────────────────────────────────────────────────────
-    injury_status           VARCHAR(32),    -- most recent status as of game_date
+    injury_status           VARCHAR(32),
 
     created_at      TIMESTAMP DEFAULT current_timestamp,
     updated_at      TIMESTAMP DEFAULT current_timestamp,
@@ -242,23 +234,21 @@ CREATE SEQUENCE IF NOT EXISTS seq_hp_id START 1;
 CREATE TABLE IF NOT EXISTS historical_props (
     id              BIGINT PRIMARY KEY DEFAULT nextval('seq_hp_id'),
     player_id       INTEGER REFERENCES players(player_id),
-    player_name     VARCHAR(128),           -- denormalized for ease
+    player_name     VARCHAR(128),
     game_id         VARCHAR(20) REFERENCES games(game_id),
     game_date       DATE NOT NULL,
-    book            VARCHAR(32),            -- sportsbook name
-    market          VARCHAR(32) NOT NULL,   -- internal market key (see config.yaml)
-    side            VARCHAR(8) NOT NULL,    -- "over" | "under"
-    line            NUMERIC(6,2) NOT NULL,  -- prop line (e.g. 24.5)
-    odds_american   SMALLINT NOT NULL,      -- American odds (e.g. -110, +120)
-    odds_decimal    NUMERIC(6,4),           -- derived: e.g. 1.9091 for -110
+    book            VARCHAR(32),
+    market          VARCHAR(32) NOT NULL,
+    side            VARCHAR(8) NOT NULL,
+    line            NUMERIC(6,2) NOT NULL,
+    odds_american   SMALLINT NOT NULL,
+    odds_decimal    NUMERIC(6,4),
 
-    -- Result (populated after the game)
-    actual_value    NUMERIC(7,2),           -- player's actual stat
-    result          VARCHAR(8),             -- "win" | "loss" | "push"
+    actual_value    NUMERIC(7,2),
+    result          VARCHAR(8),
 
-    -- Our model's projection at time of bet
     projection      NUMERIC(7,2),
-    ev_pct          NUMERIC(6,4),           -- EV% at time of capture
+    ev_pct          NUMERIC(6,4),
 
     created_at      TIMESTAMP DEFAULT current_timestamp,
 
@@ -281,8 +271,8 @@ CREATE TABLE IF NOT EXISTS projections_log (
     game_date       DATE NOT NULL,
     market          VARCHAR(32) NOT NULL,
     projection      NUMERIC(7,2),
-    model_version   VARCHAR(32),            -- e.g. git sha or date stamp
-    feature_snapshot JSON                   -- optional: serialized feature vector
+    model_version   VARCHAR(32),
+    feature_snapshot JSON
 );
 
 CREATE INDEX IF NOT EXISTS idx_projlog_player_date ON projections_log (player_id, game_date);

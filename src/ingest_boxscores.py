@@ -1,37 +1,37 @@
 """
 src/ingest_boxscores.py
-───────────────────────
+-----------------------
 Ingest per-player box score statistics for every completed game.
 
 Data source
 -----------
 nba_api  (https://github.com/swar/nba_api)
-  • BoxScoreTraditionalV3 — per-player counting stats
-  • BoxScoreAdvancedV3   — per-player advanced metrics (merged in if available)
+  - BoxScoreTraditionalV3 -- per-player counting stats
+  - BoxScoreAdvancedV3   -- per-player advanced metrics (merged in if available)
 
 V3 quirks vs V2
 ---------------
-  • All column names are camelCase instead of ALL_CAPS.
-  • `minutes` is a decimal float string (e.g. "34.566667"), NOT "MM:SS".
-  • Player name is two fields: firstName + familyName.
-  • Starter flag is `position` (non-empty = starter), not START_POSITION.
-  • Five extra kwargs are required or the API returns nothing:
+  - All column names are camelCase instead of ALL_CAPS.
+  - `minutes` is a decimal float string (e.g. "34.566667"), NOT "MM:SS".
+  - Player name is two fields: firstName + familyName.
+  - Starter flag is `position` (non-empty = starter), not START_POSITION.
+  - Five extra kwargs are required or the API returns nothing:
         end_period=1, end_range=0, range_type=0, start_period=1, start_range=0
 
 Schema contract
 ---------------
-  • Do NOT supply `id` — DuckDB auto-assigns it from seq_pgs_id.
-  • Composite columns (pra, points_rebounds, …) are plain SMALLINT columns
+  - Do NOT supply `id` -- DuckDB auto-assigns it from seq_pgs_id.
+  - Composite columns (pra, points_rebounds, ...) are plain SMALLINT columns
     computed here (GENERATED ALWAYS STORED is not supported in older DuckDB).
-  • team_id FK is nullable — old games occasionally have unmapped team IDs.
+  - team_id FK is nullable -- old games occasionally have unmapped team IDs.
 
 Rate-limit / resilience strategy
 ----------------------------------
-  • Each game's API calls are wrapped in a broad try/except.
-  • ConnectionResetError, TimeoutError, HTTPError, and any other exception
+  - Each game's API calls are wrapped in a broad try/except.
+  - ConnectionResetError, TimeoutError, HTTPError, and any other exception
     are caught, logged as WARNING, and that game is skipped.
-  • Configurable sleep between calls via NBA_API_SLEEP env var (default 0.7 s).
-  • On a per-game exception the script sleeps an extra back-off period before
+  - Configurable sleep between calls via NBA_API_SLEEP env var (default 0.7 s).
+  - On a per-game exception the script sleeps an extra back-off period before
     continuing to avoid hammering a rate-limited endpoint.
 
 Run directly:
@@ -69,7 +69,7 @@ _API_SLEEP   = float(os.getenv("NBA_API_SLEEP", "0.7"))
 _ERROR_SLEEP = float(os.getenv("NBA_API_ERROR_SLEEP", "3.0"))
 _TIMEOUT     = int(os.getenv("NBA_API_TIMEOUT", "60"))
 
-# Required by every V3 boxscore endpoint — omitting these causes KeyError
+# Required by every V3 boxscore endpoint -- omitting these causes KeyError
 _V3_EXTRA = dict(
     end_period=1,
     end_range=0,
@@ -86,7 +86,7 @@ _V3_EXTRA = dict(
 def _fetch_traditional(game_id: str) -> pd.DataFrame:
     """Call BoxScoreTraditionalV3 and return the PlayerStats DataFrame.
 
-    Raises any exception — callers are responsible for catching.
+    Raises any exception -- callers are responsible for catching.
     """
     from nba_api.stats.endpoints.boxscoretraditionalv3 import BoxScoreTraditionalV3
     bs = BoxScoreTraditionalV3(game_id=game_id, timeout=_TIMEOUT, **_V3_EXTRA)
@@ -99,7 +99,7 @@ def _fetch_traditional(game_id: str) -> pd.DataFrame:
 def _fetch_advanced(game_id: str) -> Optional[pd.DataFrame]:
     """Call BoxScoreAdvancedV3 and return the PlayerStats DataFrame.
 
-    Returns None on any failure (advanced stats are optional — we log a
+    Returns None on any failure (advanced stats are optional -- we log a
     warning and continue without them rather than failing the whole game).
     """
     try:
@@ -108,15 +108,15 @@ def _fetch_advanced(game_id: str) -> Optional[pd.DataFrame]:
         frames = bs.get_data_frames()
         if frames and not frames[0].empty:
             return frames[0]
-        logger.warning("    BoxScoreAdvancedV3 returned empty for %s — skipping adv stats", game_id)
+        logger.warning("    BoxScoreAdvancedV3 returned empty for %s -- skipping adv stats", game_id)
         return None
     except Exception as exc:
-        logger.warning("    BoxScoreAdvancedV3 failed for %s (%s) — skipping adv stats", game_id, exc)
+        logger.warning("    BoxScoreAdvancedV3 failed for %s (%s) -- skipping adv stats", game_id, exc)
         return None
 
 
 # ---------------------------------------------------------------------------
-# Column rename maps  (V3 camelCase → our snake_case DB names)
+# Column rename maps  (V3 camelCase -> our snake_case DB names)
 # ---------------------------------------------------------------------------
 
 _TRAD_RENAME = {
@@ -124,7 +124,7 @@ _TRAD_RENAME = {
     "gameId":                   "game_id",
     "teamId":                   "team_id",
     # firstName + familyName combined into full_name separately
-    "position":                 "start_position",   # non-empty → starter
+    "position":                 "start_position",   # non-empty -> starter
     "comment":                  "comment",
     "minutes":                  "min_raw",           # decimal float string
     "fieldGoalsMade":           "fgm",
@@ -292,15 +292,15 @@ def ingest_boxscore_for_game(game_id: str, game_date, con) -> int:
     """Fetch and upsert box scores for one game.
 
     Returns the number of player rows written (0 on complete failure).
-    Raises ValueError / API exceptions — caller decides whether to skip.
+    Raises ValueError / API exceptions -- caller decides whether to skip.
     """
     # --- Traditional (mandatory) ---
-    logger.debug("    Fetching traditional V3 for %s …", game_id)
+    logger.debug("    Fetching traditional V3 for %s ...", game_id)
     trad_raw = _fetch_traditional(game_id)
     time.sleep(_API_SLEEP)
 
     # --- Advanced (optional) ---
-    logger.debug("    Fetching advanced V3 for %s …", game_id)
+    logger.debug("    Fetching advanced V3 for %s ...", game_id)
     adv_raw = _fetch_advanced(game_id)
     time.sleep(_API_SLEEP)
 
@@ -330,7 +330,7 @@ def ingest_boxscore_for_game(game_id: str, game_date, con) -> int:
 
     # --- Upsert ---
     _upsert_player_stubs(df, con)
-    # Do NOT include 'id' — sequence handles it
+    # Do NOT include 'id' -- sequence handles it
     if "id" in df.columns:
         df = df.drop(columns=["id"])
     upsert_dataframe(df, "player_game_stats", ["player_id", "game_id"], con=con)
@@ -411,23 +411,23 @@ def ingest_all_boxscores(
             logger.info("[%d/%d] %s  (%s)", i, attempted, game_id, game_date)
             try:
                 n = ingest_boxscore_for_game(game_id, game_date, con)
-                logger.info("  ✓ %d player rows", n)
+                logger.info("  OK  %d player rows", n)
                 succeeded += 1
 
             except (ConnectionResetError, TimeoutError) as exc:
-                logger.warning("  ✗ Network error for %s: %s — skipping", game_id, exc)
+                logger.warning("  FAIL Network error for %s: %s -- skipping", game_id, exc)
                 skipped += 1
                 time.sleep(_ERROR_SLEEP)
 
             except Exception as exc:
                 # Catch everything else: KeyError on resultSet, ValueError from
                 # empty frames, JSON decode errors, HTTP 4xx/5xx, etc.
-                logger.warning("  ✗ Failed for %s: %s — skipping", game_id, type(exc).__name__, exc)
+                logger.warning("  FAIL %s: %s: %s -- skipping", game_id, type(exc).__name__, exc)
                 skipped += 1
                 time.sleep(_ERROR_SLEEP)
 
         logger.info(
-            "─── Summary ───  attempted=%d  succeeded=%d  skipped=%d  "
+            "--- Summary ---  attempted=%d  succeeded=%d  skipped=%d  "
             "(total outstanding before run: %d)",
             attempted, succeeded, skipped, total_found,
         )
