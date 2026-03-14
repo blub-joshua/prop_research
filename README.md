@@ -1,444 +1,243 @@
 # NBA Player Prop Research Tool
 
-A local, offline-first research tool for analyzing NBA player prop bets using
-statistical projection models and expected value (EV) calculations.
-
-**This tool is for personal research use only.** It does not place bets
-automatically. All wagering decisions are made manually at licensed Illinois
-sportsbooks.
+Personal research tool for analysing NBA player prop bets. Uses LightGBM models
+with quantile regression and isotonic calibration to project player stats and
+estimate expected value (EV) on Underdog prop lines.
 
 ---
 
-## Table of Contents
+## Quick Start
 
-1. [Architecture Overview](#architecture-overview)
-2. [Setup](#setup)
-3. [Historical Data Setup](#historical-data-setup)
-4. [Daily Workflow](#daily-workflow)
-5. [Configuration](#configuration)
-6. [Module Reference](#module-reference)
-7. [Data Sources](#data-sources)
-8. [CLI Reference](#cli-reference)
-
----
-
-## Architecture Overview
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        Daily Workflow                               │
-│                                                                     │
-│  1. ingest_games.py ──► DuckDB (games, teams)                      │
-│  2. ingest_boxscores.py ──► DuckDB (player_game_stats)             │
-│  3. ingest_injuries.py ──► DuckDB (injuries)                       │
-│         │                                                           │
-│         ▼                                                           │
-│  4. features.py ──► DuckDB (player_features)                       │
-│         │                                                           │
-│         ▼                                                           │
-│  5. models.py (train/load) ──► models/*.pkl                        │
-│         │                                                           │
-│         ▼                                                           │
-│  6. [Manual] Screenshot prop board → OCR → LLM → JSON/CSV          │
-│         │                                                           │
-│         ▼                                                           │
-│  7. cli.py ──► EV Rankings + Combo Suggestions                     │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-### Key Design Decisions
-
-- **DuckDB** is used as the local analytical database. It is fast, file-based,
-  and requires no server process.
-- **scikit-learn** (with optional LightGBM/XGBoost) handles projection models
-  for Points, Rebounds, Assists, and 3-Pointers Made.
-- **No cloud dependencies** — all data stays local. Ingestion scripts fetch
-  from public APIs/websites and write directly to DuckDB.
-- **OCR + LLM bridge** — you take screenshots of sportsbook prop boards,
-  OCR extracts the text, you paste it into an LLM (e.g. ChatGPT or Claude),
-  and the LLM returns structured JSON/CSV which you save as
-  `data/today_props_raw.json`.
-
----
-
-## Setup
-
-### Prerequisites
-
-- Python 3.11+
-- Windows 10/11 (Intel CPU, NVIDIA GPU optional for LightGBM GPU mode)
-- [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki) installed and
-  on your `PATH` (for the OCR helper)
-
-### Install Tesseract (Windows)
-
-Download the installer from:
-https://github.com/UB-Mannheim/tesseract/wiki
-
-After installation, add `C:\Program Files\Tesseract-OCR` to your system PATH,
-or set `TESSERACT_CMD` in your `.env` file.
-
-### Python Environment
-
-**Option A — venv (recommended)**
-
-```powershell
-python -m venv .venv
-.venv\Scripts\activate
+```bash
+# 1. Install dependencies
 pip install -r requirements.txt
-```
 
-**Option B — conda**
-
-```powershell
-conda create -n nba_props python=3.11
-conda activate nba_props
-pip install -r requirements.txt
-```
-
-### Initialize the Database
-
-```powershell
+# 2. Initialise the database
 python src/cli.py db-init
-```
 
-This runs `schema.sql` against `data/nba_props.duckdb` and creates all tables.
+# 3. Ingest NBA data (games, box scores, injuries)
+python src/cli.py ingest
 
-### Copy and Edit Config
-
-```powershell
-copy .env.example .env
-```
-
-Edit `.env` with your preferences (seasons, bankroll, EV threshold, etc.).
-Also review `config.yaml` for model and feature knobs.
-
----
-
-## Historical Data Setup
-
-Run these commands **once** to back-fill multiple NBA seasons.  Each step
-builds on the previous one, so run them in order.
-
-### 0. Prerequisites
-
-```powershell
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
-
-# Install Tesseract for OCR (optional — only needed for prop screenshots)
-# https://github.com/UB-Mannheim/tesseract/wiki
-
-copy .env.example .env    # then edit with your seasons / bankroll
-```
-
-### 1. Initialise the database
-
-```powershell
-python src/cli.py db-init
-# or equivalently:
-python -m src.db
-```
-
-Creates `data/nba_props.duckdb` with all table schemas.
-
-### 2. Ingest teams and game schedules
-
-```powershell
-python src/ingest_games.py
-```
-
-Default seasons from `.env` (`SEASONS=2020-21,2021-22,2022-23,2023-24,2024-25`).
-To ingest specific seasons:
-
-```powershell
-python src/ingest_games.py --seasons 2022-23 2023-24 2024-25
-```
-
-**What it does:** Pulls `LeagueGameLog` from the NBA Stats API for Regular Season
-and Playoffs.  Populates the `teams` and `games` tables.  Typical runtime:
-~1–2 minutes for 5 seasons.
-
-### 3. Ingest player box scores
-
-```powershell
-# Initial full back-fill — do in chunks to avoid long-running sessions
-python src/ingest_boxscores.py --limit 500
-python src/ingest_boxscores.py --limit 500
-# ... repeat until the script reports 0 games remaining
-
-# Or ingest all at once (will take 45–90 minutes for 5 seasons
-# due to NBA API rate limits of ~0.7s per game)
-python src/ingest_boxscores.py
-```
-
-**What it does:** For each game not yet in `player_game_stats`, fetches
-`BoxScoreTraditionalV2` (PTS, REB, AST, FG3M, MIN, ±/−) and
-`BoxScoreAdvancedV2` (USG%, pace, ratings).  Stores one row per player
-per game.  Use `--limit N` to process N games per session; re-runs are
-idempotent (already-ingested games are skipped).
-
-> **Tip for large back-fills:** Run overnight or in 500-game chunks across
-> multiple sessions.  Progress is automatically saved to the DB after each
-> game, so you can safely interrupt and resume.
-
-### 4. Ingest injuries (optional for back-testing)
-
-```powershell
-# Option A — today's injury report from Rotowire (live use)
-python src/ingest_injuries.py --source rotowire
-
-# Option B — ESPN fallback
-python src/ingest_injuries.py --source espn
-
-# Option C — load a manual CSV of historical injuries
-#   (see data/injuries_manual_template.csv for the schema)
-python src/ingest_injuries.py --source csv
-```
-
-For initial back-testing without injury data, you can skip this step —
-the model will treat all players as "Active" (injury_severity = 0).
-
-### 5. Build player features
-
-```powershell
+# 4. Build player features (~5 min on first run)
 python src/features.py
-# or for specific seasons:
-python src/features.py --seasons 2022-23 2023-24 2024-25
+
+# 5. Train all models (mean + quantile + minutes + calibration, ~3–5 min)
+python src/models.py --force-retrain
+
+# 6. Run your first daily analysis
+python src/cli.py daily --props-file data/today_props_raw.json
 ```
 
-**What it does:** Reads `player_game_stats` and `games`, computes rolling
-averages (L5, L10), season-to-date averages, H/A splits, opponent defensive
-allowed-stats (L10), rest/schedule context, and pace.  Writes results to
-`player_features`.  Saves a snapshot CSV to `data/player_features_snapshot.csv`.
+---
 
-Typical runtime: 2–5 minutes for 5 seasons on an i7.
+## Daily Workflow (Step-by-Step)
 
-### 6. Train projection models
+This is the routine you should follow each day you want to analyse props.
 
-```powershell
-python src/models.py
-# or with LightGBM:
-python src/models.py --backend lightgbm
-# or force retraining:
+### Step 1: Update Data (morning)
+
+Pull the latest box scores so the model has yesterday's results:
+
+```bash
+python src/cli.py ingest -m boxscores
+python src/features.py
+```
+
+> **How often?** Run this every morning before analysing new props. It only
+> fetches games that aren't already in the database, so it's fast after the
+> first run.
+
+### Step 2: Review Yesterday's Predictions
+
+If you ran `daily` yesterday, check how those picks did:
+
+```bash
+python src/cli.py review
+```
+
+This grades your saved predictions against the actual box scores and appends
+results to `data/tracking/performance_log.csv`.
+
+To review a specific date:
+
+```bash
+python src/cli.py review --date 2025-03-12
+```
+
+To review all un-graded dates at once:
+
+```bash
+python src/cli.py review --all
+```
+
+### Step 3: Prepare Today's Props
+
+1. **Screenshot** the prop lines you're interested in from Underdog.
+2. **Paste** the screenshots into ChatGPT (or another LLM) with this prompt:
+
+```
+I need you to convert these sportsbook screenshots into a JSON array.
+Each prop should be an object with exactly these fields:
+
+- "player_name": full name (e.g. "LeBron James")
+- "team": 3-letter abbreviation (e.g. "LAL")
+- "opponent": 3-letter abbreviation of the opposing team (e.g. "GSW")
+- "market": one of: "points", "rebounds", "assists", "threepm",
+  "points_rebounds", "points_assists", "rebounds_assists",
+  "points_rebounds_assists"
+- "line": the prop line as a number (e.g. 25.5)
+- "over_odds": American odds for the over (e.g. -115).
+  If the book shows equal odds or "pick", use -110.
+- "under_odds": American odds for the under (e.g. -105).
+  If the book shows equal odds or "pick", use -110.
+- "book": "Underdog"
+- "game_date": today's date in YYYY-MM-DD format
+
+Output ONLY the JSON array, no other text. Make sure all numbers are
+valid JSON (no + prefix on positive numbers, no trailing commas).
+```
+
+3. **Save** the JSON output to `data/today_props_raw.json`.
+
+### Step 4: Run the Daily Analysis
+
+```bash
+python src/cli.py daily --props-file data/today_props_raw.json
+```
+
+This will:
+- Load and validate your props
+- Show a preview table (confirm to continue)
+- Build projections using all models (mean + quantile + minutes)
+- Compute EV with calibrated probabilities
+- Show the top picks ranked by expected value
+- Show the best 2-leg combos
+- **Save predictions** to `data/predictions/YYYY-MM-DD_predictions.json` for
+  future review
+
+### Step 5: Check Cumulative Performance
+
+After several days of tracking:
+
+```bash
+python src/cli.py performance
+```
+
+This shows:
+- Overall win rate and P&L across all tracked days
+- Per-market breakdown (points, rebounds, assists, etc.)
+- Calibration check (are the model's predicted win rates accurate?)
+- Daily results history
+
+---
+
+## File Management Guide
+
+### Files You Edit
+
+| File | What it is | When to update |
+|---|---|---|
+| `data/today_props_raw.json` | Today's prop lines from Underdog | Every day before running `daily` |
+
+> **Important:** You overwrite `today_props_raw.json` each day. The tool
+> automatically saves dated copies of your predictions to
+> `data/predictions/YYYY-MM-DD_predictions.json` — you never need to manually
+> manage these.
+
+### Files the Tool Creates (Don't Edit)
+
+| File/Directory | Purpose |
+|---|---|
+| `data/nba_props.duckdb` | Main database (games, stats, features) |
+| `data/predictions/*.json` | Saved daily predictions (auto-created by `daily`) |
+| `data/tracking/performance_log.csv` | Cumulative graded results (auto-created by `review`) |
+| `reports/daily_*_props.csv` | Full EV analysis reports (auto-created by `daily`) |
+| `models/*.pkl` | Trained model files |
+| `models/eval/` | Training evaluation plots and metrics |
+| `logs/nba_props.log` | Application logs |
+
+### Retraining Models
+
+Retrain weekly (or after adding significant new data):
+
+```bash
 python src/models.py --force-retrain
 ```
 
-**What it does:** Trains one model per stat (PTS, REB, AST, 3PM) using the
-`player_features` table.  The most recent season is held out as the
-validation set.  Metrics (RMSE, MAE) are logged and saved to
-`models/eval/training_metrics.csv`.  Residual plots are saved to
-`models/eval/{target}_eval.png`.  Feature importances go to
-`models/eval/{target}_feature_importance.csv`.
+This retrains everything: the minutes model, all 4 stat models, the 20 quantile
+models (5 levels × 4 stats), and the 4 calibrators.
 
-Models are saved as:
+---
+
+## How the Model Works
+
+### Architecture
+
+The system uses a multi-layer approach to estimate win probabilities:
+
+1. **Minutes Model** — A separate LightGBM model predicts how many minutes a
+   player will play. This feeds into the stat models as an additional feature,
+   since minutes played is the single biggest driver of stat output.
+
+2. **Mean Regression Models** — One LightGBM model per stat (points, rebounds,
+   assists, 3PM) predicts the expected value. Uses 33 features including
+   rolling averages, opponent defense, pace, rest, and projected minutes.
+
+3. **Quantile Regression Models** — Five additional models per stat predict the
+   10th, 25th, 50th, 75th, and 90th percentiles. This captures the full shape
+   of the distribution (skew, fat tails) rather than assuming a bell curve.
+
+4. **Probability Estimation** — Instead of using a Normal CDF (which
+   systematically overestimates edge), the tool interpolates between quantile
+   predictions to estimate P(over line). This gives much more accurate
+   probabilities.
+
+5. **Isotonic Calibration** — A calibration layer trained on the validation
+   season maps raw model probabilities to historically accurate probabilities.
+   When the model says "60% chance of hitting", calibration checks whether that
+   actually hit 60% of the time and corrects any bias.
+
+### Features Used
+
+- Rolling averages (last 5, 10 games) for PTS, REB, AST, 3PM, MIN
+- Rolling standard deviations (volatility signals)
+- Season-to-date averages
+- Home/away splits
+- Opponent defensive stats (points/rebounds/assists/3PM allowed, L10)
+- Days rest, back-to-back flag
+- Injury severity
+- Team pace
+- **Projected minutes** (from the minutes model)
+
+### EV Calculation
+
 ```
-models/points_model.pkl
-models/rebounds_model.pkl
-models/assists_model.pkl
-models/threepm_model.pkl
+EV% = (model_probability × decimal_odds) - 1
 ```
 
-### 7. Run the synthetic backtest (sanity check)
+A positive EV means the model thinks the bet is worth more than the odds imply.
+The tool shows "Win %" (the model's estimated probability of hitting) alongside
+EV so you can evaluate both the edge and the confidence.
 
-```powershell
-python src/backtest.py --mode synthetic
-```
+---
 
-Simulates prop lines by offsetting each projection by ±k × std.  Runs the
-full EV pipeline and reports win rates and P&L at various EV thresholds.
-Results saved to `data/backtest_results.csv`.
+## CLI Reference
 
-To import real historical lines (e.g., from a CSV you've built up):
-
-```powershell
-python src/backtest.py --import-csv data/your_historical_lines.csv
-python src/backtest.py --mode real --ev-threshold 0.03
-```
-
-### Full pipeline — one-liner order
-
-```powershell
-python src/cli.py db-init
-python src/ingest_games.py
-python src/ingest_boxscores.py --limit 500   # repeat until done
-python src/ingest_injuries.py --source auto
-python src/features.py
-python src/models.py
-python src/backtest.py --mode synthetic
-```
-
-### Expected disk usage
-
-| Data | Approx size |
+| Command | Description |
 |---|---|
-| 5 seasons of games (~6 000 games) | < 1 MB |
-| 5 seasons of box scores (~180 000 player-game rows) | ~40 MB |
-| player_features table | ~60 MB |
-| Trained model .pkl files (4×) | ~20–80 MB each (LightGBM) |
-| Total DuckDB file | ~150–250 MB |
-
----
-
-## Daily Workflow
-
-### Step 1 — Update Historical Data
-
-```powershell
-# Pull schedule + results for configured seasons
-python src/ingest_games.py
-
-# Pull player box scores
-python src/ingest_boxscores.py
-
-# Pull / update injury report
-python src/ingest_injuries.py
-```
-
-These scripts are idempotent — re-running them will upsert rather than
-duplicate rows.
-
-### Step 2 — Rebuild Features and Retrain Models
-
-```powershell
-# Compute rolling/aggregate features into player_features table
-python src/features.py
-
-# Train (or load cached) projection models
-python src/models.py
-```
-
-Models are saved under `models/` as `.pkl` files. If a model file already
-exists and `FORCE_RETRAIN=false` in your `.env`, it will be loaded instead of
-retrained.
-
-### Step 3 — Capture Today's Props
-
-1. Take a screenshot of the prop board on your sportsbook.
-2. Run the OCR helper to extract raw text:
-
-```powershell
-python src/ocr_helper.py --image screenshots/props_today.png
-```
-
-This prints the extracted text to stdout and saves it to
-`data/ocr_raw_output.txt`.
-
-3. Paste the text into your LLM of choice with the following prompt:
-
-```
-You are a data extractor. Parse the following sportsbook prop board text into
-a JSON array. Each element should have these fields:
-  player_name, team, opponent, market, line, over_odds, under_odds, book, game_date
-
-Return ONLY the JSON array, no explanation.
-
----
-[PASTE OCR TEXT HERE]
----
-```
-
-4. Save the JSON response to `data/today_props_raw.json`.
-
-   Alternatively, if you receive CSV output, save it as
-   `data/today_props_raw.csv`.
-
-### Step 4 — Run Daily EV Analysis
-
-```powershell
-# Using the new daily command (recommended)
-python src/cli.py daily --props-file data/today_props_raw.json
-
-# Optional flags:
-python src/cli.py daily --props-file data/today_props_raw.json --top-n-singles 15 --top-n-combos 3
-python src/cli.py daily --props-file data/today_props_raw.json --date 2026-03-13
-
-# Or using the original analyze command:
-python src/cli.py analyze
-```
-
-The ``daily`` command:
-
-1. Loads and validates your props file (JSON or CSV).
-2. Resolves player names to IDs using the ``players`` table.
-3. Previews the props in a formatted table and asks for confirmation.
-4. Builds feature vectors and runs projection models for each player.
-5. Computes EV for every prop line (Over and Under).
-6. Ranks single props by EV and suggests the top 2 bets with Kelly sizing.
-7. Enumerates all 2-leg combos and ranks them by combo EV.
-8. Saves a full CSV report to ``reports/daily_YYYYMMDD_props.csv``.
-
-Output will include:
-
-- A ranked table of all props by EV%.
-- The top 2 single props above your configured EV threshold.
-- The best 2-leg parlay combos (EV computed assuming independence).
-
-### How to Generate ``data/today_props_raw.json``
-
-1. **Screenshot** the prop board on your sportsbook app.
-2. **OCR** the screenshot:
-   ```powershell
-   python src/ocr_helper.py --image screenshots/props_today.png
-   ```
-3. **Paste** the OCR text into an LLM (ChatGPT, Claude, etc.) with this prompt:
-   ```
-   Parse the following sportsbook prop board text into a JSON array.
-   Each element must have these fields:
-     player_name, team, opponent, market, line, over_odds, under_odds, book, game_date
-
-   Use these market values: points, rebounds, assists, threepm,
-   points_rebounds, points_assists, rebounds_assists, points_rebounds_assists
-
-   Return ONLY the JSON array.
-
-   ---
-   [PASTE OCR TEXT]
-   ---
-   ```
-4. **Save** the JSON response to ``data/today_props_raw.json``.
-5. **Run** the daily command:
-   ```powershell
-   python src/cli.py daily --props-file data/today_props_raw.json
-   ```
-
----
-
-## Configuration
-
-### `.env` file
-
-```
-# Tesseract binary path (Windows — adjust if needed)
-TESSERACT_CMD=C:\Program Files\Tesseract-OCR\tesseract.exe
-
-# Database path (relative to project root)
-DB_PATH=data/nba_props.duckdb
-
-# Model directory
-MODELS_DIR=models
-
-# Force retrain even if model files exist
-FORCE_RETRAIN=false
-
-# Bankroll for Kelly sizing display (dollars)
-BANKROLL=1000
-
-# Minimum EV% to display in output
-EV_THRESHOLD=0.03
-
-# Seasons to ingest (comma-separated, format: YYYY-YY)
-SEASONS=2022-23,2023-24,2024-25
-```
-
-### `config.yaml`
-
-See the file for detailed knobs including:
-- Rolling window sizes for features (L5, L10, L20, season)
-- Model hyperparameter grids
-- Combo max legs
-- Output formatting options
+| `db-init` | Create/update database tables |
+| `ingest -m games` | Fetch NBA schedule data |
+| `ingest -m boxscores` | Fetch player box scores |
+| `ingest -m injuries` | Fetch injury reports |
+| `features` | Rebuild player feature table |
+| `train [--force-retrain]` | Train all models |
+| `daily --props-file PATH` | Full daily analysis pipeline |
+| `review [--date YYYY-MM-DD] [--all]` | Grade past predictions |
+| `performance [--days N]` | Show cumulative stats |
+| `analyze --props-file PATH` | Quick EV analysis (no tracking) |
+| `backtest [--ev-threshold N]` | Run backtest on historical data |
+| `show-props --props-file PATH` | Preview loaded props |
+| `show-projections` | Show raw model projections |
 
 ---
 
@@ -446,120 +245,32 @@ See the file for detailed knobs including:
 
 | Module | Purpose |
 |---|---|
-| `src/db.py` | DuckDB connection helper and SQL runner |
-| `src/schema.sql` | DDL for all tables |
-| `src/ingest_games.py` | Fetch NBA schedule and game results |
-| `src/ingest_boxscores.py` | Fetch player box score data |
-| `src/ingest_injuries.py` | Fetch injury reports |
-| `src/features.py` | Compute rolling/contextual player features |
-| `src/models.py` | Train/load/predict projection models |
-| `src/projections.py` | Build daily projection vectors for inference |
-| `src/backtest.py` | Backtest projections against historical lines |
-| `src/props_io.py` | Parse today's props from JSON/CSV |
-| `src/ev_calc.py` | EV, Kelly, and combo ranking logic |
-| `src/ocr_helper.py` | Tesseract OCR on prop board screenshots |
-| `src/cli.py` | Main CLI entry point |
+| `cli.py` | Command-line interface and orchestration |
+| `db.py` | DuckDB connection, schema, upsert utilities |
+| `features.py` | Feature engineering (rolling stats, opponent defense, etc.) |
+| `models.py` | Model training: mean, quantile, minutes, calibration |
+| `projections.py` | Live inference — builds projections for today's players |
+| `ev_calc.py` | EV computation, Kelly sizing, combo ranking |
+| `props_io.py` | Load/normalise/validate prop lines from JSON/CSV |
+| `review.py` | Grade predictions, track performance over time |
+| `backtest.py` | Historical backtesting against synthetic/real prop lines |
+| `ingest_games.py` | NBA API game schedule ingestion |
+| `ingest_boxscores.py` | NBA API box score ingestion |
+| `ingest_injuries.py` | Injury report ingestion |
 
 ---
 
-## Data Sources
+## Environment Variables
 
-Ingestion scripts use public APIs with no authentication required:
+Set these in a `.env` file in the project root:
 
-| Source | Data |
-|---|---|
-| [nba_api](https://github.com/swar/nba_api) | Schedules, box scores, team/player IDs |
-| [Rotowire / CBS Sports](https://www.rotowire.com/basketball/nba-lineups.php) | Injury / lineup info (web fetch fallback) |
-
-All data is stored locally in `data/nba_props.duckdb`. No data is ever sent
-to external services.
-
----
-
-## CLI Reference
-
-```
-python src/cli.py <command> [options]
-
-Commands:
-  db-init               Initialize database schema
-  ingest                Run all ingestion scripts
-  features              Rebuild player features
-  train                 Train/retrain projection models
-  daily                 Load props + compute projections + EV + suggest bets
-  analyze               Run EV analysis on today's props
-  backtest              Backtest projections vs historical lines
-  show-props            Pretty-print today's loaded props
-  show-projections      Show model projections for today's players
-
-Global Options:
-  --verbose             Print debug output
-
-Daily Options:
-  --props-file PATH     Path to today's props JSON/CSV (required)
-  --top-n-singles INT   Number of top single props to show (default: 10)
-  --top-n-combos INT    Number of top 2-leg combos to show (default: 2)
-  --date DATE           Game date YYYY-MM-DD (default: today)
-
-Analyze Options:
-  --props-file PATH     Path to today's props JSON/CSV (default: data/today_props_raw.json)
-  --ev-threshold FLOAT  Override EV threshold from .env
-  --date DATE           Game date for analysis (default: today, format: YYYY-MM-DD)
-  --force-retrain       Force model retraining even if .pkl exists
-```
-
----
-
-## Project Structure
-
-```
-nba_props/
-├── .env.example
-├── .gitignore
-├── README.md
-├── config.yaml
-├── requirements.txt
-├── pyproject.toml
-│
-├── data/
-│   ├── .gitkeep
-│   ├── nba_props.duckdb          # Created on db-init
-│   ├── today_props_raw.json      # You create this daily
-│   └── ocr_raw_output.txt        # Created by ocr_helper.py
-│
-├── models/
-│   ├── .gitkeep
-│   ├── points_model.pkl
-│   ├── rebounds_model.pkl
-│   ├── assists_model.pkl
-│   └── threepm_model.pkl
-│
-├── logs/
-│   └── .gitkeep
-│
-├── reports/
-│   └── daily_YYYYMMDD_props.csv   # Generated by daily command
-│
-└── src/
-    ├── db.py
-    ├── schema.sql
-    ├── ingest_games.py
-    ├── ingest_boxscores.py
-    ├── ingest_injuries.py
-    ├── features.py
-    ├── models.py
-    ├── projections.py          # Loads models + builds daily projections
-    ├── backtest.py
-    ├── props_io.py
-    ├── ev_calc.py
-    ├── ocr_helper.py
-    └── cli.py
-```
-
----
-
-## Legal Note
-
-This tool is for personal research and entertainment purposes only. It does not
-constitute gambling advice. All bets are placed manually and voluntarily at
-licensed, legal sportsbooks in Illinois. Use responsibly.
+| Variable | Default | Description |
+|---|---|---|
+| `DB_PATH` | `data/nba_props.duckdb` | Database file location |
+| `MODELS_DIR` | `models` | Directory for saved models |
+| `LOG_FILE` | `logs/nba_props.log` | Log file path |
+| `LOG_LEVEL` | `INFO` | Logging verbosity |
+| `EV_THRESHOLD` | `0.03` | Minimum EV% to display (3%) |
+| `BANKROLL` | `1000` | Your bankroll in dollars (for Kelly sizing) |
+| `MAX_KELLY_FRACTION` | `0.05` | Max fraction of bankroll per bet (5%) |
+| `FORCE_RETRAIN` | `false` | Force model retraining on every run |
