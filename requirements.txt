@@ -6,6 +6,8 @@ scikit-learn
 lightgbm
 xgboost
 joblib
+scipy
+matplotlib
 
 nba_api
 
