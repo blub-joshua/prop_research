@@ -37,9 +37,16 @@ models:
     - rebounds
     - assists
     - threepm
+    - minutes
 
   # Backend to use: "ridge", "lightgbm", or "xgboost"
   backend: lightgbm
+
+  # Quantile levels for distributional modeling
+  quantile_levels: [0.10, 0.25, 0.50, 0.75, 0.90]
+
+  # Enable isotonic calibration of win probabilities
+  calibration: true
 
   # Cross-validation folds for hyperparameter search.
   cv_folds: 5

@@ -4,10 +4,7 @@ src/projections.py
 Helper module that loads trained models and computes a projections DataFrame
 for a set of players on a given date.
 
-Used by the ``daily`` and ``analyze`` CLI commands to bridge the gap between
-the feature pipeline and the EV calculator.
-
-The main entry point is ``build_projections_for_date()``.
+v2: now uses the full model stack (mean + quantile + minutes).
 """
 
 from __future__ import annotations
@@ -39,32 +36,12 @@ def build_projections_for_date(
 ) -> pd.DataFrame:
     """Build a projections DataFrame for the given players and date.
 
-    This is the single entry point that the daily / analyze commands call.
-    It orchestrates:
-      1. Loading (or training) projection models.
-      2. Building live feature vectors for each player as of ``game_date``.
-      3. Running inference to get projected stats.
-
-    Parameters
-    ----------
-    player_ids : list[int]
-        NBA API player IDs appearing in today's props.
-    game_date : date or str
-        The target game date (e.g. today).
-    opponent_map : dict, optional
-        {player_id: opponent_team_id}.
-    is_home_map : dict, optional
-        {player_id: 1 or 0}.
-    con : duckdb connection, optional
-
-    Returns
-    -------
-    pd.DataFrame
-        One row per player with columns:
-        player_id, proj_points, proj_rebounds, proj_assists, proj_threepm,
-        proj_points_rebounds, proj_points_assists, proj_rebounds_assists,
-        proj_points_rebounds_assists, pts_std_L10, reb_std_L10, ast_std_L10,
-        fg3m_std_L10, and all feature columns.
+    Returns a DataFrame with:
+      - proj_minutes, proj_points, proj_rebounds, proj_assists, proj_threepm
+      - composite proj_* columns
+      - quantile predictions: {target}_q{level}
+      - IQR-based std: {target}_iqr_std
+      - std columns: pts_std_L10, reb_std_L10, ast_std_L10, fg3m_std_L10
     """
     _close = con is None
     if con is None:
@@ -78,9 +55,9 @@ def build_projections_for_date(
             logger.warning("No player IDs supplied — returning empty projections.")
             return pd.DataFrame()
 
-        # 1. Load trained models
+        # 1. Load trained models (full stack)
         models = load_models()
-        logger.info("Loaded %d projection models.", len(models))
+        logger.info("Loaded models: %s", [k for k in models.keys() if not k.endswith("_quantiles") and not k.endswith("_calibrator")])
 
         # 2. Build feature vectors for today
         features_df = build_features_for_today(
@@ -103,7 +80,7 @@ def build_projections_for_date(
             len(features_df), len(player_ids),
         )
 
-        # 3. Predict
+        # 3. Predict (mean + quantile + minutes)
         proj_df = predict(features_df, models)
 
         # Ensure std columns are present for EV calc
@@ -122,28 +99,13 @@ def resolve_context_maps(
     props_df: pd.DataFrame,
     con,
 ) -> tuple[dict[int, int], dict[int, int]]:
-    """Derive opponent_map and is_home_map from the props DataFrame.
-
-    Uses the ``team`` and ``opponent`` columns (abbreviation strings) in the
-    props and resolves them to team IDs via the teams table.
-
-    Parameters
-    ----------
-    props_df : pd.DataFrame
-        Must have player_id, and optionally team, opponent columns.
-    con : duckdb connection
-
-    Returns
-    -------
-    (opponent_map, is_home_map) : tuple[dict, dict]
-    """
+    """Derive opponent_map and is_home_map from the props DataFrame."""
     opponent_map: dict[int, int] = {}
     is_home_map: dict[int, int] = {}
 
     if "team" not in props_df.columns or "opponent" not in props_df.columns:
         return opponent_map, is_home_map
 
-    # Load team abbreviation -> team_id
     teams = con.execute(
         "SELECT team_id, abbreviation FROM teams"
     ).df()
@@ -165,9 +127,6 @@ def resolve_context_maps(
         if opp_abbr in abbr_to_id:
             opponent_map[pid] = abbr_to_id[opp_abbr]
 
-        # Heuristic: if the team column matches the home_team for today's
-        # schedule, mark as home.  Without schedule data for today, we
-        # default to 0 (away) since is_home has a small effect.
         is_home_map.setdefault(pid, 0)
 
     return opponent_map, is_home_map
