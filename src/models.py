@@ -891,17 +891,15 @@ def predict(
     X_ext["proj_minutes"] = df["proj_minutes"]
 
     # ── 2. Mean predictions ──────────────────────────────────────────────
+    #  All stat models (points, rebounds, assists, threepm) are trained with
+    #  FEATURE_COLS_WITH_MINUTES via _train_with_minutes(), so they always
+    #  need X_ext.  Only the minutes model itself uses X_base.
     for target in TARGET_COLUMNS:
         if target not in models:
             continue
         pipeline = models[target]
         col = f"proj_{target}"
-        # Determine which feature set the model expects
-        n_features = _get_model_n_features(pipeline)
-        if n_features == len(FEATURE_COLS_WITH_MINUTES):
-            preds = pipeline.predict(X_ext)
-        else:
-            preds = pipeline.predict(X_base)
+        preds = pipeline.predict(X_ext)
         df[col] = np.clip(preds, 0, None)
 
     # ── 3. Composite projections ─────────────────────────────────────────
